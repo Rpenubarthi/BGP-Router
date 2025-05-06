@@ -1,0 +1,334 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+
+class Router:
+
+    relations = {}
+    sockets = {}
+    ports = {}
+    routing_table = []
+    announcements = []
+
+
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    # Update routing table
+    def update(self, json_data, srcif):
+        msg = json_data['msg']
+
+
+        new_route = {
+            'network': msg['network'],
+            'netmask': msg['netmask'],
+            'peer': srcif,
+            'localpref': msg.get('localpref', 100),
+            'ASPath': msg['ASPath'],
+            'selfOrigin': msg.get('selfOrigin', False),
+            'origin': msg.get('origin', 'UNK'),
+        }
+
+
+        self.routing_table.append(new_route)
+        self.aggregate_routes()
+
+
+        for neighbor in self.sockets:
+            if neighbor == srcif:
+                continue
+            if self.relations[srcif] == "cust":
+                self.format_and_send_update(neighbor, msg['network'], msg['netmask'], msg['ASPath'])
+            elif self.relations[srcif] in ["peer", "prov"]:
+                if self.relations[neighbor] == "cust":
+                    self.format_and_send_update(neighbor, msg['network'], msg['netmask'], msg['ASPath'])
+
+
+    def data(self, msg, srcif):
+        dst_ip_addr = msg['dst']
+        matching_routes = []
+        best_len = -1
+
+
+        dst_ip_int = self.ip_to_int(dst_ip_addr)
+        for route in self.routing_table:
+            route_network = route['network']
+            route_net_int = self.ip_to_int(route_network)
+            route_netmask = route['netmask']
+            route_mask_int = self.ip_to_int(route_netmask)
+
+            if (dst_ip_int & route_mask_int) == (route_net_int & route_mask_int):
+                mask_len = bin(route_mask_int).count('1')
+                if mask_len > best_len:
+                    matching_routes = [route]
+                    best_len = mask_len
+                elif mask_len == best_len:
+                    matching_routes.append(route)
+
+
+        if not matching_routes:
+            self.send_no_route_msg(srcif)
+            return
+
+
+        best_route = matching_routes[0]
+        for route in matching_routes[1:]:
+            if self.compare_paths(route, best_route):
+                best_route = route
+
+
+        next_hop = best_route['peer']
+        src_relation = self.relations[srcif]
+        dst_relation = self.relations[next_hop]
+
+
+        if src_relation == "cust" or dst_relation == "cust":
+            self.send(next_hop, json.dumps(msg))
+        else:
+            self.send_no_route_msg(srcif)
+
+    # Handle route withdrawals and update the routing table accordingly
+    def withdraw(self, msg, srcif):
+        for msg_entry in msg['msg']:
+            withdrawn_network = msg_entry['network']
+            withdrawn_netmask = msg_entry['netmask']
+
+            withdrawn_network_int = self.ip_to_int(withdrawn_network)
+            withdrawn_netmask_int = self.ip_to_int(withdrawn_netmask)
+
+            affected_routes = []
+            for route in self.routing_table[:]:
+                route_network = self.ip_to_int(route['network'])
+                route_netmask = self.ip_to_int(route['netmask'])
+
+                if route['peer'] == srcif:
+                    is_exact_match = (route['network'] == withdrawn_network and route['netmask'] == withdrawn_netmask)
+                    if is_exact_match:
+                        affected_routes.append(route)
+                    else:
+                        match_network = (withdrawn_network_int & route_netmask) == (route_network & route_netmask)
+                        if match_network:
+                            affected_routes.append(route)
+
+                            current_mask_length = bin(route_netmask).count('1')
+                            withdrawn_netmask_length = bin(withdrawn_netmask_int).count('1')
+                            network_start_ip = route_network & route_netmask
+                            network_end_ip = network_start_ip + (1 << (32 - current_mask_length))
+
+                            ip_step = 1 << (32 - withdrawn_netmask_length)
+                            for ip in range(network_start_ip, network_end_ip, ip_step):
+                                if ip != withdrawn_network_int:
+                                    new_route = route.copy()
+                                    new_route['network'] = self.int_to_ip(ip)
+                                    new_route['netmask'] = withdrawn_netmask
+                                    self.routing_table.append(new_route)
+
+            for route in affected_routes:
+                if route in self.routing_table:
+                    self.routing_table.remove(route)
+
+            self.aggregate_routes()
+
+            for neighbor_socket in self.sockets:
+                if neighbor_socket == srcif:
+                    continue
+                if self.relations[srcif] == "cust":
+                    self.format_and_send_withdraw(neighbor_socket, msg_entry)
+                elif self.relations[srcif] in ["peer", "prov"] and self.relations[neighbor_socket] == "cust":
+                    self.format_and_send_withdraw(neighbor_socket, msg_entry)
+
+    # Send routing table to the requesting neighbor
+    def dumps(self, msg, srcif):
+        self.aggregate_routes()
+        table_msg = {
+            "type": "table",
+            "src": self.our_addr(srcif),
+            "dst": msg['src'],
+            "msg": self.routing_table
+        }
+        self.send(srcif, json.dumps(table_msg))
+
+    # Create and send a BGP update message
+    def format_and_send_update(self, neighbor, network_addr, netmask_addr, ASPath):
+        new_msg = {
+            "type": "update",
+            "src": self.our_addr(neighbor),
+            "dst": neighbor,
+            "msg": {
+                "network": network_addr,
+                "netmask": netmask_addr,
+                "ASPath": [self.asn] + ASPath,
+            }
+        }
+        self.send(neighbor, json.dumps(new_msg))
+
+    # Create and send a BGP withdraw message
+    def format_and_send_withdraw(self, neighbor, entry):
+        withdraw_msg = {
+            "type": "withdraw",
+            "src": self.our_addr(neighbor),
+            "dst": neighbor,
+            "msg": [entry]
+        }
+        self.send(neighbor, json.dumps(withdraw_msg))
+
+    def aggregate_routes(self):
+        while True:
+            has_aggregated = False
+            self.routing_table.sort(key=lambda x: self.ip_to_int(x['network']))
+
+            count = 0
+            while count < len(self.routing_table) - 1:
+                route1 = self.routing_table[count]
+                route2 = self.routing_table[count + 1]
+
+                if self.can_aggregate(route1, route2):
+                    net1 = self.ip_to_int(route1['network'])
+                    mask = self.ip_to_int(route1['netmask'])
+                    new_mask = (0xffffffff << (32 - (bin(mask).count('1') - 1))) & 0xffffffff
+
+                    aggregated_route = route1.copy()
+                    aggregated_route['network'] = self.int_to_ip(net1 & new_mask)
+                    aggregated_route['netmask'] = self.int_to_ip(new_mask)
+
+                    self.routing_table[count:count + 2] = [aggregated_route]
+
+                    has_aggregated = True
+                else:
+                    count += 1
+
+            if not has_aggregated:
+                break
+
+    def can_aggregate(self, route1, route2):
+        if (route1['localpref'] != route2['localpref'] or
+                route1['peer'] != route2['peer'] or
+                route1['selfOrigin'] != route2['selfOrigin'] or
+                route1['origin'] != route2['origin'] or
+                route1['ASPath'] != route2['ASPath']):
+            return False
+
+        mask = self.ip_to_int(route1['netmask'])
+        network1 = self.ip_to_int(route1['network'])
+        network2 = self.ip_to_int(route2['network'])
+
+        if self.ip_to_int(route2['netmask']) != mask:
+            return False
+
+        mask_length = bin(mask).count('1')
+        new_mask = (0xffffffff << (32 - (mask_length - 1))) & 0xffffffff
+
+        return ((network1 & new_mask) == (network2 & new_mask) and
+                abs(network1 - network2) == (1 << (32 - mask_length)))
+
+
+    def send_no_route_msg(self, srcif):
+        self.send(srcif, json.dumps({
+            "type": "no route",
+            "src": self.our_addr(srcif),
+            "dst": srcif,
+            "msg": {}
+        }))
+
+    def ip_to_int(self, ip_addr):
+        return struct.unpack("!I", socket.inet_aton(ip_addr))[0]
+
+    def int_to_ip(self, ip_int):
+        return socket.inet_ntoa(struct.pack("!I", ip_int))
+
+
+    def pref(self, relation1, relation2):
+        if relation1 != relation2:
+            if relation1 == "cust":
+                return True
+            elif relation1 == "peer" and relation2 == "provider":
+                return True
+            elif relation2 == "cust":
+                return False
+            elif relation2 == "peer" and relation1 == "provider":
+                return False
+
+
+    def compare_paths(self, route1, route2):
+
+        preference = self.pref(self.relations[route1['peer']], self.relations[route2['peer']])
+
+        if type(preference) is bool:
+            return preference
+
+        elif route1['localpref'] != route2['localpref']:
+            return route1['localpref'] > route2['localpref']
+
+        elif route1['selfOrigin'] != route2['selfOrigin']:
+            return route1['selfOrigin']
+
+        elif len(route1['ASPath']) != len(route2['ASPath']):
+            return len(route1['ASPath']) < len(route2['ASPath'])
+
+        def assign_priority(type):
+            if type == 'IGP':
+                return 3
+            if type == 'EGP':
+                return 2
+            return 1
+
+        origin1 = route1['origin']
+        origin2 = route2['origin']
+
+        if origin1 != origin2:
+            priority1 = assign_priority(origin1)
+            priority2 = assign_priority(origin2)
+            return priority1 > priority2
+
+        return route1['peer'] < route2['peer']
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg = json.loads(k.decode('utf-8'))
+
+                match msg['type']:
+                    case 'update':
+                        self.update(msg, srcif)
+                    case 'data':
+                        self.data(msg, srcif)
+                    case 'dump':
+                        self.dumps(msg, srcif)
+                    case 'withdraw':
+                        self.withdraw(msg, srcif)
+
+                print("Received message '%s' from %s" % (msg, srcif))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
